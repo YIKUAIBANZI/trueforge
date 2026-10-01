@@ -2,7 +2,8 @@ import { AgentSpecSchema } from '@truefoundry/trueforge-core/agent-session';
 import { createLogger } from 'winston';
 import type { AgentRecord } from '../../../src/db/agentStore';
 import { McpServerNotFoundError, type McpServerRecord } from '../../../src/db/mcpServerStore';
-import { createTrueFoundryRequestContext } from '../../../src/truefoundry/accessToken';
+import { ACTOR_AUTHORIZATION_HEADER, createTrueFoundryRequestContext } from '../../../src/truefoundry/accessToken';
+import { X_TFY_METADATA } from '../../../src/truefoundry/gatewayMetadata';
 import { MCP_PROXY_BASE_URL_TEMPLATE } from '../../../src/truefoundry/mapSfyMcpServers';
 import type { TrueFoundryMcpApiClient } from '../../../src/truefoundry/TrueFoundryMcpServerStore';
 import {
@@ -52,15 +53,17 @@ function createMockClient(): MockClient {
     getMcpAuthStatus: jest.fn(),
     deleteMcpAuth: jest.fn(),
     vendToken: jest.fn(),
+    getTenantControlPlaneUrl: jest.fn(),
   };
 }
 
 function createStore(input?: {
   accessToken?: string;
+  userCredential?: string | null;
   client?: MockClient;
   subject?: { id: string; type: string; display_name: string };
   agent?: AgentRecord;
-  publicBaseUrl?: string;
+  controlPlaneUrl?: string;
 }) {
   const client = input?.client ?? createMockClient();
   client.getMcpServerByName.mockResolvedValue(SFY_ROW);
@@ -69,6 +72,7 @@ function createStore(input?: {
   client.getMcpAuthorize.mockResolvedValue({ status: 'authenticated' });
   client.getMcpAuthStatus.mockResolvedValue({ status: 'authenticated' });
   client.deleteMcpAuth.mockResolvedValue(undefined);
+  client.getTenantControlPlaneUrl.mockResolvedValue(input?.controlPlaneUrl ?? PUBLIC_BASE_URL);
   if (input?.agent !== undefined) {
     client.vendToken.mockResolvedValue({ subjectToken: SUBJECT_TOKEN, actorToken: ACTOR_TOKEN });
   }
@@ -78,8 +82,8 @@ function createStore(input?: {
       tenant_id: TENANT,
       subject: input?.subject ?? { id: 'user-1', type: 'user', display_name: 'user-1' },
       roles: [],
-      user_credential: input?.accessToken ?? ACCESS_TOKEN,
-      public_base_url: input?.publicBaseUrl ?? PUBLIC_BASE_URL,
+      user_credential:
+        input?.userCredential !== undefined ? input.userCredential : (input?.accessToken ?? ACCESS_TOKEN),
     }),
     agent: input?.agent,
     logger: createLogger({ silent: true }),
@@ -159,10 +163,11 @@ describe('TrueFoundryMcpServerStore', () => {
   });
 
   describe('authorize', () => {
-    it('derives upstream redirectURL from return_to and session public base URL', async () => {
+    it('derives upstream redirectURL from return_to and tenant control-plane URL', async () => {
       const { store, client } = createStore();
       const returnTo = '/trueforge/?screenType=mcp-auth&pUid=popup-1';
       await store.authorize({ tenant_id: TENANT, name: 'github', userRef: 'user-1', returnTo });
+      expect(client.getTenantControlPlaneUrl).toHaveBeenCalledWith({ tenantName: TENANT });
       expect(client.getMcpAuthorize).toHaveBeenCalledWith({
         accessToken: ACCESS_TOKEN,
         mcpServerId: 'mcp-id-1',
@@ -170,10 +175,10 @@ describe('TrueFoundryMcpServerStore', () => {
       });
     });
 
-    it('throws when session public base URL is missing', async () => {
-      const { store } = createStore({ publicBaseUrl: '' });
+    it('throws when tenant control-plane URL is invalid', async () => {
+      const { store } = createStore({ controlPlaneUrl: '' });
       await expect(store.authorize({ tenant_id: TENANT, name: 'github', userRef: 'user-1' })).rejects.toMatchObject({
-        message: 'Tenant public base URL from session is required for TrueFoundry MCP OAuth',
+        message: 'Tenant control-plane URL is required for TrueFoundry MCP OAuth',
         statusCode: 500,
       });
     });
@@ -206,10 +211,11 @@ describe('TrueFoundryMcpServerStore', () => {
       });
     });
 
-    it('uses asUser with a saved agent', async () => {
+    it('uses the caller credential for delete with a saved agent', async () => {
       const { store, client } = createStore({ agent: AGENT });
       await store.deleteAuthorization({ tenant_id: TENANT, name: 'github', userRef: 'ignored' });
-      expect(client.deleteMcpAuth).toHaveBeenCalledWith(expect.objectContaining({ accessToken: SUBJECT_TOKEN }));
+      expect(client.deleteMcpAuth).toHaveBeenCalledWith(expect.objectContaining({ accessToken: ACCESS_TOKEN }));
+      expect(client.getMcpServerByName).toHaveBeenCalledWith(expect.objectContaining({ accessToken: ACTOR_TOKEN }));
     });
   });
 
@@ -247,10 +253,10 @@ describe('TrueFoundryMcpServerStore', () => {
       });
     });
 
-    it('uses asUser for live status with a saved agent', async () => {
+    it('uses the caller credential for live status with a saved agent', async () => {
       const { store, client } = createStore({ agent: AGENT });
       await store.resolveAuthStatuses({ records: [dcrRecord()], userRef: 'user-1' });
-      expect(client.getMcpAuthStatus).toHaveBeenCalledWith(expect.objectContaining({ accessToken: SUBJECT_TOKEN }));
+      expect(client.getMcpAuthStatus).toHaveBeenCalledWith(expect.objectContaining({ accessToken: ACCESS_TOKEN }));
     });
 
     it('calls live status for a single truefoundry record without wire auth', async () => {
@@ -323,15 +329,65 @@ describe('TrueFoundryMcpServerStore', () => {
       });
     });
 
-    it('uses asUser for authorize and gateway Bearer, asAgent for SFY lookups with a saved agent', async () => {
+    it('merges turn metadata after auth headers and leaves authRequired untouched', async () => {
+      const { store, client } = createStore();
+      const headers = store.resolveInvokeHeaders({
+        record: dcrRecord(),
+        userRef: 'user-1',
+        turnMetadata: {
+          sessionId: 'sess-1',
+          turnId: 'turn-1',
+          agent: { id: 'agent-1', name: 'named' },
+          requestHeaders: { 'x-tfy-metadata': JSON.stringify({ env: 'prod' }) },
+        },
+      });
+      if (typeof headers !== 'function') {
+        throw new Error('expected async headers resolver for truefoundry MCP');
+      }
+      const resolved = await headers();
+      expect(resolved).toEqual({
+        headers: {
+          Authorization: `Bearer ${ACCESS_TOKEN}`,
+          [X_TFY_METADATA]: expect.any(String),
+        },
+      });
+      if (!('headers' in resolved) || resolved.headers === undefined) {
+        throw new Error('expected invoke headers');
+      }
+      expect(JSON.parse(resolved.headers[X_TFY_METADATA] ?? '')).toMatchObject({ env: 'prod' });
+
+      client.getMcpAuthorize.mockResolvedValue({
+        status: 'auth_required',
+        authorization_url: 'https://consent.example/authorize',
+      });
+      await expect(headers()).resolves.toEqual({
+        authRequired: {
+          servers: [{ id: 'github', name: 'github', auth_url: 'https://consent.example/authorize' }],
+        },
+      });
+    });
+
+    it('delegates invoke: caller bearer, actor header, actor token for SFY lookups', async () => {
       const { store, client } = createStore({ agent: AGENT });
+      await expect(invoke(store)).resolves.toEqual({
+        headers: {
+          Authorization: `Bearer ${ACCESS_TOKEN}`,
+          [ACTOR_AUTHORIZATION_HEADER]: `Bearer ${ACTOR_TOKEN}`,
+        },
+      });
+      expect(client.getMcpAuthorize).toHaveBeenCalledWith(expect.objectContaining({ accessToken: ACCESS_TOKEN }));
+      expect(client.getMcpServerByName).toHaveBeenCalledWith(expect.objectContaining({ accessToken: ACTOR_TOKEN }));
+      expect(client.listGatewayInstallations).toHaveBeenCalledWith(ACTOR_TOKEN);
+      expect(client.vendToken).toHaveBeenCalledTimes(1);
+    });
+
+    it('exchanges invoke: subject token bearer and no actor header', async () => {
+      const { store, client } = createStore({ agent: AGENT, userCredential: null });
       await expect(invoke(store)).resolves.toEqual({
         headers: { Authorization: `Bearer ${SUBJECT_TOKEN}` },
       });
       expect(client.getMcpAuthorize).toHaveBeenCalledWith(expect.objectContaining({ accessToken: SUBJECT_TOKEN }));
       expect(client.getMcpServerByName).toHaveBeenCalledWith(expect.objectContaining({ accessToken: ACTOR_TOKEN }));
-      expect(client.listGatewayInstallations).toHaveBeenCalledWith(ACTOR_TOKEN);
-      expect(client.vendToken).toHaveBeenCalledTimes(1);
     });
 
     it('throws 422 when auth_required lacks authorization_url', async () => {

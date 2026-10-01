@@ -1,14 +1,16 @@
 'use client';
 
-import { Suspense, useEffect, useMemo, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 
 import { useSessionShareSearch } from '../../hooks/useSessionShareSearch.js';
 import { useOptionalAgentSessionsServer } from '../../server/ServerContext.js';
+import { useShellMode } from '../../server/ShellModeContext.js';
 import { useSlot } from '../../theme/SlotsProvider.js';
 import {
   defaultSessionTimeRange,
   readSessionShareSearch,
   resolveSessionTimeRange,
+  SESSION_TIME_BUFFER_MS,
   type SessionTimeRange,
 } from '../../utils/sessionShareUrl.js';
 import { PageHeader } from '../PageHeader.js';
@@ -16,9 +18,11 @@ import { Skeleton } from '../primitives/Skeleton.js';
 
 export function SessionsPage() {
   const sessionsServer = useOptionalAgentSessionsServer();
+  const shell = useShellMode();
   const { updateShareSearch } = useSessionShareSearch();
   const AgentSessions = useSlot('AgentSessions');
   const AgentSessionsFilters = useSlot('AgentSessionsFilters');
+  const sharedSessionId = shell.sharedSessionId;
 
   const [agentFilter, setAgentFilter] = useState<string | null>(
     () => readSessionShareSearch(window.location.search).agentId,
@@ -28,6 +32,7 @@ export function SessionsPage() {
   );
 
   useEffect(() => {
+    if (sharedSessionId != null) return;
     const share = readSessionShareSearch(window.location.search);
     updateShareSearch({
       view: 'sessions',
@@ -47,27 +52,57 @@ export function SessionsPage() {
     return () => window.removeEventListener('popstate', syncFilters);
   }, []);
 
-  // Resolve relative presets only when the filter changes. Unrelated query
-  // updates (such as selecting a session) must not shift/refetch the list.
-  const resolved = useMemo(() => resolveSessionTimeRange(timeRange), [timeRange]);
+  const [refreshEpoch, setRefreshEpoch] = useState(0);
+  const [isReloading, setIsReloading] = useState(false);
+
+  const handleReload = useCallback(() => {
+    setIsReloading(true);
+    setRefreshEpoch(epoch => epoch + 1);
+  }, []);
+
+  const handleLoadingChange = useCallback((loading: boolean) => {
+    if (!loading) {
+      setIsReloading(false);
+    }
+  }, []);
+
+  // Resolve relative presets only when the filter changes or reload is requested.
+  // Unrelated query updates (such as selecting a session) must not shift/refetch the list.
+  const resolved = useMemo(
+    () => resolveSessionTimeRange(timeRange),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [timeRange, refreshEpoch],
+  );
+  const timeRangeDurationMs = timeRange.endTs - timeRange.startTs;
+  const showLoadRecentSessions =
+    timeRange.timeWindowMs == null && timeRangeDurationMs > 0 && timeRangeDurationMs <= 2 * SESSION_TIME_BUFFER_MS;
+  const loadRecentSessions = useCallback(() => {
+    const recentRange = defaultSessionTimeRange();
+    setTimeRange(recentRange);
+    updateShareSearch({ timeRange: recentRange, sessionId: null, view: 'sessions' });
+  }, [updateShareSearch]);
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col bg-primary-bg">
       <PageHeader
         title="Agent Sessions"
         end={
-          <AgentSessionsFilters
-            agentId={agentFilter}
-            timeRange={timeRange}
-            onAgentChange={nextAgentId => {
-              setAgentFilter(nextAgentId);
-              updateShareSearch({ agentId: nextAgentId, sessionId: null, view: 'sessions' });
-            }}
-            onTimeRangeChange={nextRange => {
-              setTimeRange(nextRange);
-              updateShareSearch({ timeRange: nextRange, sessionId: null, view: 'sessions' });
-            }}
-          />
+          sharedSessionId == null ? (
+            <AgentSessionsFilters
+              agentId={agentFilter}
+              timeRange={timeRange}
+              onAgentChange={nextAgentId => {
+                setAgentFilter(nextAgentId);
+                updateShareSearch({ agentId: nextAgentId, sessionId: null, view: 'sessions' });
+              }}
+              onTimeRangeChange={nextRange => {
+                setTimeRange(nextRange);
+                updateShareSearch({ timeRange: nextRange, sessionId: null, view: 'sessions' });
+              }}
+              onReload={sessionsServer == null ? undefined : handleReload}
+              isReloading={isReloading}
+            />
+          ) : null
         }
       />
       <div className="min-h-0 flex-1">
@@ -82,10 +117,21 @@ export function SessionsPage() {
             }
           >
             <AgentSessions
+              refreshKey={refreshEpoch}
+              onLoadingChange={handleLoadingChange}
               agentId={agentFilter ?? undefined}
               startTimestamp={new Date(resolved.startTs).toISOString()}
               endTimestamp={new Date(resolved.endTs).toISOString()}
-              shareView="sessions"
+              {...(sharedSessionId == null
+                ? {
+                    shareView: 'sessions' as const,
+                    ...(showLoadRecentSessions ? { onLoadRecentSessions: loadRecentSessions } : {}),
+                  }
+                : {
+                    detailOnly: true,
+                    detailSessionId: sharedSessionId,
+                    onCloseDetail: shell.closeSharedSession,
+                  })}
             />
           </Suspense>
         )}

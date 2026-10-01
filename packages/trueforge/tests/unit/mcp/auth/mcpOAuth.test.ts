@@ -1,8 +1,20 @@
 /**
  * MCP OAuth / DCR helper tests (node:test style via jest).
- * Global fetch is stubbed; production code uses real fetch only.
+ * Global fetch is stubbed; production ssrfFetch uses undici, so undici.fetch forwards here.
  */
+jest.mock('undici', () => {
+  const actual = jest.requireActual<typeof import('undici')>('undici');
+  return {
+    ...actual,
+    fetch: (input: unknown, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      return globalThis.fetch(url, init);
+    },
+  };
+});
+
 import { resourceUrlFromServerUrl } from '@modelcontextprotocol/sdk/shared/auth-utils.js';
+import { configureOutboundUrlGuard } from '@truefoundry/trueforge-core/core';
 import { InMemoryOAuthClientStore, InMemoryOAuthTokenStore } from '../../../../src/mcp/auth/inMemoryStores';
 import {
   buildMcpAuthorizationUrl,
@@ -34,7 +46,15 @@ const USER_REF = 'user-a';
 
 const realFetch = globalThis.fetch;
 
+beforeEach(() => {
+  configureOutboundUrlGuard({
+    allowedHosts: ['mcp.example.com', 'auth.example.com'],
+    blockedHosts: [],
+  });
+});
+
 afterEach(() => {
+  configureOutboundUrlGuard({ allowedHosts: [], blockedHosts: [] });
   globalThis.fetch = realFetch;
 });
 
@@ -299,7 +319,7 @@ describe('buildMcpAuthorizationUrl', () => {
     const { tokenStore } = newStores();
     stubOauthFetch({});
 
-    const authUrl = await buildMcpAuthorizationUrl({
+    const { authorizationUrl: authUrl, state } = await buildMcpAuthorizationUrl({
       tokenStore,
       client: sampleClient,
       serverId: SERVER_ID,
@@ -317,9 +337,9 @@ describe('buildMcpAuthorizationUrl', () => {
     expect(authUrl.searchParams.get('code_challenge')).toBeTruthy();
     expect(authUrl.searchParams.get('resource')).toBe(resourceUrlFromServerUrl(SERVER_URL).href);
 
-    const state = authUrl.searchParams.get('state');
     expect(state).toBeTruthy();
-    const pending = await tokenStore.consumePendingAuthorization({ state: state! });
+    expect(authUrl.searchParams.get('state')).toBe(state);
+    const pending = await tokenStore.consumePendingAuthorization({ state });
     expect(pending).toMatchObject({
       state,
       id: SERVER_ID,
@@ -337,7 +357,7 @@ describe('buildMcpAuthorizationUrl', () => {
       server: { ...sampleClient.server, codeChallengeMethodsSupported: null },
     };
 
-    const authUrl = await buildMcpAuthorizationUrl({
+    const { authorizationUrl: authUrl } = await buildMcpAuthorizationUrl({
       tokenStore,
       client,
       serverId: SERVER_ID,
@@ -604,7 +624,7 @@ describe('completeMcpAuthorization', () => {
     const stores = newStores();
     await stores.mcpServerStore.saveClient({ id: SERVER_ID, record: sampleClient });
 
-    const authUrl = await buildMcpAuthorizationUrl({
+    const { authorizationUrl: authUrl, state } = await buildMcpAuthorizationUrl({
       tokenStore: stores.tokenStore,
       client: sampleClient,
       serverId: SERVER_ID,
@@ -613,7 +633,7 @@ describe('completeMcpAuthorization', () => {
       mcpServerName: SERVER_NAME,
       returnTo: '/connected',
     });
-    const state = authUrl.searchParams.get('state')!;
+    expect(authUrl.searchParams.get('state')).toBe(state);
 
     const { tokenBodies } = stubOauthFetch({
       tokenResponse: {
@@ -681,7 +701,7 @@ describe('completeMcpAuthorization', () => {
     const stores = newStores();
     const deleteClient = jest.spyOn(stores.mcpServerStore, 'deleteClient');
     await stores.mcpServerStore.saveClient({ id: SERVER_ID, record: sampleClient });
-    const authUrl = await buildMcpAuthorizationUrl({
+    const { state } = await buildMcpAuthorizationUrl({
       tokenStore: stores.tokenStore,
       client: sampleClient,
       serverId: SERVER_ID,
@@ -690,7 +710,6 @@ describe('completeMcpAuthorization', () => {
       mcpServerName: SERVER_NAME,
       returnTo: '/after',
     });
-    const state = authUrl.searchParams.get('state')!;
 
     globalThis.fetch = (async (input, init) => {
       const url = String(input);

@@ -10,13 +10,15 @@ import {
   type GetExternalIdsByIdsInput,
   type GetOwnedIdsInput,
   type IAgentStore,
+  type ListAgentNamesUsingSandboxEnvironmentInput,
   type ListAgentsInput,
   type UpdateAgentInput,
 } from '../db/agentStore';
 import { PostgresAgentStore } from '../db/postgres/agent-store/PostgresAgentStore';
 import type { Database } from '../db/postgres/types';
 import { AGENT_DESCRIPTION_MAX_LENGTH } from '../schemas/agent';
-import { callerAccessToken, type ResolveAccessToken } from './accessToken';
+import { captureCriticalException } from '../sentry';
+import { callerAccessToken, type ResolveServiceFoundryAuthorization } from './accessToken';
 import {
   TrueFoundryServiceFoundryServerClient,
   type PutRemoteAgentInput,
@@ -77,7 +79,7 @@ function toPutRemoteAgentPayload({
 export class TrueFoundryAgentStore implements IAgentStore<Transaction<Database>> {
   readonly #inner: PostgresAgentStore;
   readonly #client: TrueFoundryServiceFoundryServerClient;
-  readonly #resolveAccessToken: ResolveAccessToken;
+  readonly #resolveAccessToken: ResolveServiceFoundryAuthorization;
   readonly #db: Kysely<Database>;
 
   constructor(input: {
@@ -112,6 +114,13 @@ export class TrueFoundryAgentStore implements IAgentStore<Transaction<Database>>
 
   getAgent(input: GetAgentInput, transaction?: Transaction<Database>): Promise<AgentRecord | undefined> {
     return this.#inner.getAgent(input, transaction);
+  }
+
+  listAgentNamesUsingSandboxEnvironment(
+    input: ListAgentNamesUsingSandboxEnvironmentInput,
+    transaction?: Transaction<Database>,
+  ): Promise<readonly string[]> {
+    return this.#inner.listAgentNamesUsingSandboxEnvironment(input, transaction);
   }
 
   // Takes a Postgres transaction advisory lock for this tenant + agent id so concurrent
@@ -174,7 +183,19 @@ export class TrueFoundryAgentStore implements IAgentStore<Transaction<Database>>
         failures.push(asError(cleanupError));
       }
       if (failures.length > 1) {
-        throw new AggregateError(failures, 'createAgent failed and cleanup also failed', { cause: error });
+        const aggregate = new AggregateError(failures, 'createAgent failed and cleanup also failed', {
+          cause: error,
+        });
+        captureCriticalException(aggregate, {
+          tags: { module: 'TrueFoundryAgentStore', operation: 'dualWrite' },
+          extra: {
+            agent_id: created.id,
+            agent_name: created.name,
+            tenant_id: input.tenant_id,
+            external_id: externalId,
+          },
+        });
+        throw aggregate;
       }
       throw error;
     }
@@ -226,11 +247,21 @@ export class TrueFoundryAgentStore implements IAgentStore<Transaction<Database>>
             }),
           });
         } catch (restoreError) {
-          throw new AggregateError(
+          const aggregate = new AggregateError(
             [asError(error), asError(restoreError)],
             'updateAgent failed and ServiceFoundry restore also failed',
             { cause: restoreError },
           );
+          captureCriticalException(aggregate, {
+            tags: { module: 'TrueFoundryAgentStore', operation: 'dualWrite' },
+            extra: {
+              agent_id: input.id,
+              agent_name: previous.name,
+              tenant_id: input.tenant_id,
+              external_id: previous.external_id,
+            },
+          });
+          throw aggregate;
         }
         throw error;
       }

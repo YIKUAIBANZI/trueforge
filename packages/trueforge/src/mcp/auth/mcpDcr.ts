@@ -13,7 +13,7 @@ import type {
   OAuthTokens,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
-import { McpConnectionError, McpDcrConfigurationError } from '@truefoundry/trueforge-core/core';
+import { McpConnectionError, McpDcrConfigurationError, ssrfFetch } from '@truefoundry/trueforge-core/core';
 import { randomBytes } from 'node:crypto';
 import {
   isOAuthAccessTokenUsable,
@@ -40,10 +40,10 @@ export const MCP_OAUTH_HTTP_TIMEOUT_MS = 15_000;
  * Used by discoverOAuthServerInfo / registerClient / refreshAuthorization / exchangeAuthorization
  * (startAuthorization is local PKCE + URL construction and never calls this).
  */
-const mcpOAuthFetch: FetchLike = (url, init) => {
+const mcpOAuthFetch: FetchLike = async (url, init) => {
   const timeoutSignal = AbortSignal.timeout(MCP_OAUTH_HTTP_TIMEOUT_MS);
   const signal = init?.signal != null ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
-  return fetch(url, { ...init, signal });
+  return ssrfFetch(url, { ...init, signal });
 };
 
 function isTimeoutError(error: unknown): boolean {
@@ -209,7 +209,7 @@ export async function buildMcpAuthorizationUrl(params: {
   mcpServerUrl: string;
   mcpServerName: string;
   returnTo?: string;
-}): Promise<URL> {
+}): Promise<{ authorizationUrl: URL; state: string }> {
   const state = randomBytes(32).toString('base64url');
   const redirectUri = mcpOAuthCallbackUrl();
   let started: Awaited<ReturnType<typeof startAuthorization>>;
@@ -234,7 +234,7 @@ export async function buildMcpAuthorizationUrl(params: {
     codeVerifier: started.codeVerifier,
     returnTo: params.returnTo ?? null,
   });
-  return started.authorizationUrl;
+  return { authorizationUrl: started.authorizationUrl, state };
 }
 
 export async function resolveMcpAuth(params: {
@@ -279,7 +279,7 @@ export async function resolveMcpAuth(params: {
   if (token) {
     await params.tokenStore.deleteToken(tokenKey);
   }
-  const authUrl = await buildMcpAuthorizationUrl({
+  const { authorizationUrl: authUrl } = await buildMcpAuthorizationUrl({
     tokenStore: params.tokenStore,
     client,
     serverId: params.serverId,

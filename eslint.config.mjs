@@ -46,6 +46,7 @@ export default defineConfig(
       '**/node_modules/**',
       '**/dist/**',
       '**/coverage/**',
+      'data/**',
       '**/.pnpm-store/**',
       '**/.eslintcache',
       // Excluded from package tsconfigs; run via tsx/jest, not the type-aware ESLint project.
@@ -74,6 +75,10 @@ export default defineConfig(
         tsconfigRootDir: import.meta.dirname,
       },
     },
+    rules: {
+      // Allow `void x` for unused bindings; --fix of this rule drops them into unused-vars failures.
+      '@typescript-eslint/no-meaningless-void-operator': 'off',
+    },
   },
   {
     files: ['packages/frontend/src/**/*.{ts,tsx}'],
@@ -94,6 +99,9 @@ export default defineConfig(
       },
       globals: browserGlobals,
     },
+    rules: {
+      '@typescript-eslint/no-meaningless-void-operator': 'off',
+    },
   },
   {
     // Vite config is outside the frontend src tsconfig project.
@@ -109,6 +117,10 @@ export default defineConfig(
         __dirname: 'readonly',
       },
     },
+  },
+  {
+    files: ['packages/assistant-ui-runtime/*.config.ts'],
+    extends: [tseslint.configs.disableTypeChecked],
   },
   {
     files: ['**/*.{js,mjs,cjs}'],

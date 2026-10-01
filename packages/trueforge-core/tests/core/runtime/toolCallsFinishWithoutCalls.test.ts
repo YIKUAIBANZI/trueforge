@@ -127,6 +127,7 @@ describe('AgentThread tool_calls finish without tool_calls', () => {
       status: 'error',
     });
     if (terminal.type === InternalEventType.AGENT_DONE && terminal.status === 'error') {
+      if (terminal.parent === undefined) throw new Error('expected child completion');
       expect(terminal.send_to_parent).toMatchObject({ role: 'tool', tool_call_id: 'call-parent' });
     }
   });

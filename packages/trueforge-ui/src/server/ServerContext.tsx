@@ -2,6 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
+import { CanCreateAgentProvider } from '../hooks/useCanCreateAgent.js';
 import type {
   AgentBuilderCapabilitiesResponse,
   AgentMetricsServer,
@@ -58,7 +59,9 @@ export function ServerProvider({ server, children }: { server: AgentUIServer; ch
 
   return (
     <ServerContext.Provider value={server}>
-      <ServerCapabilitiesContext.Provider value={capabilitiesValue}>{children}</ServerCapabilitiesContext.Provider>
+      <ServerCapabilitiesContext.Provider value={capabilitiesValue}>
+        <CanCreateAgentProvider permissionsServer={server.permissions ?? null}>{children}</CanCreateAgentProvider>
+      </ServerCapabilitiesContext.Provider>
     </ServerContext.Provider>
   );
 }
@@ -90,7 +93,7 @@ export function useOptionalRefreshServerCapabilities(): (() => void) | null {
 export function useCatalogServer(): CatalogServer {
   const server = useServer();
   if (server.catalog == null) {
-    throw new Error('useCatalogServer requires AgentUIServer.catalog. Pass catalog to createTrueFoundryServer.');
+    throw new Error('useCatalogServer requires AgentUIServer.catalog. Pass catalog to createTrueForgeServer.');
   }
   return server.catalog;
 }
@@ -126,7 +129,7 @@ export function useOptionalAgentMetricsServer(): AgentMetricsServer | null {
 export function useScheduleServer(): ScheduleServer {
   const server = useServer();
   if (server.schedules == null) {
-    throw new Error('useScheduleServer requires AgentUIServer.schedules. Pass schedules to createTrueFoundryServer.');
+    throw new Error('useScheduleServer requires AgentUIServer.schedules. Pass schedules to createTrueForgeServer.');
   }
   return server.schedules;
 }

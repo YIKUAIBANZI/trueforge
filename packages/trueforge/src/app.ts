@@ -3,12 +3,11 @@ import { swaggerUI } from '@hono/swagger-ui';
 import { OpenAPIHono, z } from '@hono/zod-openapi';
 import type { ISessionStore, Sessions, TurnStreamingEvent } from '@truefoundry/trueforge-core/agent-session';
 import { extractErrorLogFields } from '@truefoundry/trueforge-core/core';
-import type { RequestReplyRouter } from '@truefoundry/trueforge-core/request-reply';
+import type { RedisClient, RequestReplyRouter } from '@truefoundry/trueforge-core/request-reply';
 import type { Context, ErrorHandler, MiddlewareHandler } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { HTTPException } from 'hono/http-exception';
 import type { Configuration } from 'openid-client';
-import type { RedisClientType } from 'redis';
 import type { Logger } from 'winston';
 import { createAgentImportRouter } from './apis/agentImport';
 import { createAgentsRouter } from './apis/agents';
@@ -19,6 +18,8 @@ import { createMcpOAuthRouter } from './apis/mcpOAuth';
 import { createMcpServersRouter } from './apis/mcpServers';
 import { createModelsRouter } from './apis/models';
 import { createPermissionsRouter } from './apis/permissions';
+import { createSandboxEnvironmentBuildRouter } from './apis/sandboxEnvironmentBuild';
+import { createSandboxEnvironmentsRouter } from './apis/sandboxEnvironments';
 import { createScheduleExecutionRouter, createSchedulesRouter } from './apis/schedules';
 import { createInternalMetricsRouter } from './apis/sessionMetrics';
 import { createInternalSessionsRouter, createSessionsRouter } from './apis/sessions';
@@ -33,20 +34,24 @@ import {
   createApiKeyAuthMiddleware,
   createAuthMiddleware,
   truefoundryAdminMiddleware,
+  tryAuthenticate,
 } from './auth/middleware';
 import type { McpCatalog } from './catalog/McpCatalog';
 import type { ModelCatalog } from './catalog/ModelCatalog';
 import type { SandboxCatalog } from './catalog/SandboxCatalog';
 import type { SkillCatalog } from './catalog/SkillCatalog';
+import type { WebSearchCatalog } from './catalog/WebSearchCatalog';
 import configuration, { getPublicUiBasePath, getTrueForgeAuthMode, TrueForgeAuthMode } from './config';
 import type { AgentRecord, IAgentStore } from './db/agentStore';
 import type { IMcpServerWithAuthStore } from './db/mcpServerStore';
 import type { IModelProviderStore } from './db/modelProviderStore';
+import type { ISandboxEnvironmentStore } from './db/sandboxEnvironmentStore';
 import type { ISandboxProviderStore } from './db/sandboxProviderStore';
 import type { IScheduleStore } from './db/scheduleStore';
 import type { ISessionMetricsStore } from './db/sessionMetricsStore';
 import type { ISkillStore } from './db/skillStore';
 import type { WithTransaction } from './db/transaction';
+import type { IWebSearchProviderStore } from './db/webSearchProviderStore';
 import { createClientCertificateMiddleware } from './http/tls';
 import type { IOAuthTokenStore } from './mcp/auth/types';
 import { PACKAGE_VERSION } from './packageVersion';
@@ -177,6 +182,7 @@ export interface ServerDeps<TTransaction> {
   mcpCatalog: McpCatalog;
   skillCatalog: SkillCatalog;
   sandboxCatalog: SandboxCatalog;
+  webSearchCatalog: WebSearchCatalog;
   /** Per-request store: DB singleton, or a token-bound TrueFoundry store in TrueFoundry mode. */
   resolveModelProviderStore: (c: Context, runAsAgent?: AgentRecord) => IModelProviderStore<TTransaction>;
   /**
@@ -193,6 +199,7 @@ export interface ServerDeps<TTransaction> {
    * (`TRUEFOUNDRY_SANDBOX_*` + static SETTINGS JSON).
    */
   resolveSandboxProviderStore: (c: Context) => ISandboxProviderStore<TTransaction>;
+  resolveWebSearchProviderStore: (c: Context) => IWebSearchProviderStore<TTransaction>;
   /** Per-request store: DB git skills, or TrueFoundry registry catalog in TrueFoundry mode. */
   resolveSkillStore: ResolveSkillStore<TTransaction>;
   withTransaction: WithTransaction<TTransaction>;
@@ -202,12 +209,19 @@ export interface ServerDeps<TTransaction> {
   sessionMetricsStore: ISessionMetricsStore;
   /** Persistence agent store (schedule runs resolve the bound agent without an HTTP caller). */
   agentStore: IAgentStore<TTransaction>;
+  /** Sandbox environment parent + version persistence (no TrueFoundry dual-write). */
+  sandboxEnvironmentStore: ISandboxEnvironmentStore<TTransaction>;
+  /**
+   * Context-free sandbox provider store for internal build progress (persistence or TFY).
+   * Same backing store as resolveSandboxProviderStore, without request context.
+   */
+  sandboxProviderStore: ISandboxProviderStore<TTransaction>;
   /** Resolve turn skills - persistence store or TrueFoundry resolve with Service API key (schedule runs do have any caller token). */
   turnSkillsResolverStore: Pick<ISkillStore<TTransaction>, 'resolveTurnSkills'>;
   sessions: Sessions;
   activeTurns: ActiveTurnRegistry;
   /** Primary Redis client (server-owned); undefined in standalone mode. */
-  redis?: RedisClientType | undefined;
+  redis?: RedisClient | undefined;
   /** Request-reply dispatch table served by this replica's executor. */
   requestReplyRouter: RequestReplyRouter;
   /** Hands out each turn's resumable event stream to the create and subscribe handlers. */
@@ -236,6 +250,8 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
     resolveModelProviderStore: deps.resolveModelProviderStore,
     resolveMcpServerStore: deps.resolveMcpServerStore,
     resolveSandboxProviderStore: deps.resolveSandboxProviderStore,
+    sandboxEnvironmentStore: deps.sandboxEnvironmentStore,
+    resolveWebSearchProviderStore: deps.resolveWebSearchProviderStore,
     activeTurns: deps.activeTurns,
     turnSkillsResolverStore: deps.turnSkillsResolverStore,
   };
@@ -243,7 +259,7 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
   if (configuration.ACCESS_LOGS) {
     app.use('*', createAccessLogMiddleware(deps.logger));
   }
-  if (!configuration.STANDALONE && configuration.TRUEFORGE_MTLS_ENABLED) {
+  if (!configuration.STANDALONE && configuration.MTLS_ENABLED) {
     app.use('*', createClientCertificateMiddleware(deps.logger));
   }
   app.use('*', createRequestBodyLimitMiddleware(configuration.MAX_REQUEST_BODY_BYTES));
@@ -262,7 +278,8 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
     '/api/v1/capabilities',
     withAuth(
       createCapabilitiesRouter({
-        resolveSandboxProviderStore: deps.resolveSandboxProviderStore,
+        sandboxEnvironmentStore: deps.sandboxEnvironmentStore,
+        resolveWebSearchProviderStore: deps.resolveWebSearchProviderStore,
         withTransaction: deps.withTransaction,
         logger: deps.logger,
         resolveRequestContext,
@@ -289,6 +306,7 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
         mcpCatalog: deps.mcpCatalog,
         skillCatalog: deps.skillCatalog,
         sandboxCatalog: deps.sandboxCatalog,
+        webSearchCatalog: deps.webSearchCatalog,
       }),
       authMiddleware,
     ),
@@ -301,6 +319,7 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
       tokenStore: deps.tokenStore,
       mcpServerStore: deps.resolveMcpServerStore(),
       logger: deps.logger,
+      resolveSession: c => tryAuthenticate({ authenticator: deps.authenticator, context: c }),
     }),
   );
   app.route(
@@ -336,6 +355,8 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
         resolveMcpServerStore: deps.resolveMcpServerStore,
         resolveSkillStore: deps.resolveSkillStore,
         resolveSandboxProviderStore: deps.resolveSandboxProviderStore,
+        sandboxEnvironmentStore: deps.sandboxEnvironmentStore,
+        resolveWebSearchProviderStore: deps.resolveWebSearchProviderStore,
         withTransaction: deps.withTransaction,
         resolveRequestContext,
         authorizer: deps.authorizer,
@@ -344,8 +365,31 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
     ),
   );
   app.route(
+    '/api/v1/sandbox-environments',
+    withAuth(
+      createSandboxEnvironmentsRouter({
+        sandboxEnvironmentStore: deps.sandboxEnvironmentStore,
+        resolveAgentStore: deps.resolveAgentStore,
+        resolveSandboxProviderStore: deps.resolveSandboxProviderStore,
+        resolveRequestContext,
+      }),
+      authMiddleware,
+    ),
+  );
+  app.route(
     '/api/internal/schedules',
     withAuth(createScheduleExecutionRouter(scheduleTurnDeps), scheduleExecutionAuthMiddleware),
+  );
+  app.route(
+    '/api/internal/sandbox-environments',
+    withAuth(
+      createSandboxEnvironmentBuildRouter({
+        sandboxEnvironmentStore: deps.sandboxEnvironmentStore,
+        sandboxProviderStore: deps.sandboxProviderStore,
+        logger: deps.logger,
+      }),
+      scheduleExecutionAuthMiddleware,
+    ),
   );
   app.route(
     '/api/v1/schedules',
@@ -369,6 +413,8 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
         tokenStore: deps.tokenStore,
         resolveSkillStore: deps.resolveSkillStore,
         resolveSandboxProviderStore: deps.resolveSandboxProviderStore,
+        sandboxEnvironmentStore: deps.sandboxEnvironmentStore,
+        resolveWebSearchProviderStore: deps.resolveWebSearchProviderStore,
         withTransaction: deps.withTransaction,
         logger: deps.logger,
         resolveRequestContext,
@@ -396,6 +442,8 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
         resolveSkillStore: deps.resolveSkillStore,
         resolveAgentStore: deps.resolveAgentStore,
         resolveSandboxProviderStore: deps.resolveSandboxProviderStore,
+        sandboxEnvironmentStore: deps.sandboxEnvironmentStore,
+        resolveWebSearchProviderStore: deps.resolveWebSearchProviderStore,
         resolveRequestContext,
         authorizer: deps.authorizer,
       }),
@@ -439,6 +487,8 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
         resolveSkillStore: deps.resolveSkillStore,
         resolveAgentStore: deps.resolveAgentStore,
         resolveSandboxProviderStore: deps.resolveSandboxProviderStore,
+        sandboxEnvironmentStore: deps.sandboxEnvironmentStore,
+        resolveWebSearchProviderStore: deps.resolveWebSearchProviderStore,
         redis: deps.redis,
         requestReplyRouter: deps.requestReplyRouter,
         resolveRequestContext,
@@ -461,6 +511,8 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
         resolveAgentStore: deps.resolveAgentStore,
         eventSubscriptions: deps.eventSubscriptions,
         resolveSandboxProviderStore: deps.resolveSandboxProviderStore,
+        sandboxEnvironmentStore: deps.sandboxEnvironmentStore,
+        resolveWebSearchProviderStore: deps.resolveWebSearchProviderStore,
         logger: deps.logger,
         resolveRequestContext,
         authorizer: deps.authorizer,
@@ -470,17 +522,19 @@ export function createServerApp<TTransaction>(deps: ServerDeps<TTransaction>) {
   );
 
   const uiBasePath = getPublicUiBasePath();
-  const openApiSpecPath = `${uiBasePath}api/v1/openapi.json`;
-  const openApiServerUrl = uiBasePath === '/' ? undefined : uiBasePath.replace(/\/$/, '');
-  app.get('/api/v1/docs', swaggerUI({ url: openApiSpecPath }));
-  app.get('/api/v1/openapi.json', c =>
-    c.json(
-      buildOpenApiDocument(app, {
-        authEnabled,
-        ...(openApiServerUrl === undefined ? {} : { serverUrl: openApiServerUrl }),
-      }),
-    ),
-  );
+  if (configuration.SWAGGER_ENABLED) {
+    const openApiSpecPath = `${uiBasePath}api/v1/openapi.json`;
+    const openApiServerUrl = uiBasePath === '/' ? undefined : uiBasePath.replace(/\/$/, '');
+    app.get('/api/v1/docs', swaggerUI({ url: openApiSpecPath }));
+    app.get('/api/v1/openapi.json', c =>
+      c.json(
+        buildOpenApiDocument(app, {
+          authEnabled,
+          ...(openApiServerUrl === undefined ? {} : { serverUrl: openApiServerUrl }),
+        }),
+      ),
+    );
+  }
 
   app.notFound(routeNotFound);
 

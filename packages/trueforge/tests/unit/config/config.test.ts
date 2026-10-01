@@ -1,5 +1,9 @@
-import { getPublicUiBasePath, type ServerConfiguration } from '../../../src/config';
-import { resolveTrueFoundrySandboxProviderConfig } from '../../../src/truefoundry/resolveTrueFoundrySandboxProviderConfig';
+import type { ServerConfiguration } from '../../../src/config';
+import { buildRedisStandaloneUrl, getPublicUiBasePath } from '../../../src/config';
+import {
+  hasTrueFoundrySandboxProviderConfig,
+  resolveTrueFoundrySandboxProviderConfig,
+} from '../../../src/truefoundry/resolveTrueFoundrySandboxProviderConfig';
 
 /** Minimal distributed config slice for resolve tests (unused fields are irrelevant). */
 function distributed(overrides: {
@@ -107,6 +111,50 @@ describe('resolveTrueFoundrySandboxProviderConfig', () => {
   });
 });
 
+describe('hasTrueFoundrySandboxProviderConfig', () => {
+  it('returns true when shared provider config resolves', () => {
+    expect(
+      hasTrueFoundrySandboxProviderConfig(
+        distributed({
+          TRUEFOUNDRY_SANDBOX_ENABLED: true,
+          TRUEFOUNDRY_SANDBOX_PROVIDER: 'truefoundry',
+          TRUEFOUNDRY_SANDBOX_SERVER_URL: 'http://sandbox-server',
+          TRUEFOUNDRY_SANDBOX_SETTINGS: JSON.stringify({ nats_bridge_url: 'ws://nats-bridge' }),
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it('returns false when sandbox is disabled', () => {
+    expect(hasTrueFoundrySandboxProviderConfig(distributed({}))).toBe(false);
+  });
+
+  it('returns false instead of throwing when settings are incomplete', () => {
+    expect(
+      hasTrueFoundrySandboxProviderConfig(
+        distributed({
+          TRUEFOUNDRY_SANDBOX_ENABLED: true,
+          TRUEFOUNDRY_SANDBOX_PROVIDER: 'truefoundry',
+          TRUEFOUNDRY_SANDBOX_SETTINGS: JSON.stringify({ nats_bridge_url: 'ws://nats-bridge' }),
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it('returns false instead of throwing when settings JSON is invalid', () => {
+    expect(
+      hasTrueFoundrySandboxProviderConfig(
+        distributed({
+          TRUEFOUNDRY_SANDBOX_ENABLED: true,
+          TRUEFOUNDRY_SANDBOX_PROVIDER: 'daytona',
+          TRUEFOUNDRY_SANDBOX_API_KEY: 'dtn-key',
+          TRUEFOUNDRY_SANDBOX_SETTINGS: '{not-json',
+        }),
+      ),
+    ).toBe(false);
+  });
+});
+
 describe('getPublicUiBasePath', () => {
   it('ignores a path-bearing PUBLIC_BASE_URL in standalone non-development', () => {
     expect(
@@ -127,5 +175,34 @@ describe('getPublicUiBasePath', () => {
         PUBLIC_BASE_URL: 'https://host.example/custom/proxy/path',
       } as ServerConfiguration),
     ).toBe('/custom/proxy/path/');
+  });
+});
+
+describe('buildRedisStandaloneUrl', () => {
+  const base = {
+    port: 6379,
+    database: 0,
+    username: undefined,
+    password: undefined,
+  };
+
+  it('builds a hostname URL', () => {
+    expect(buildRedisStandaloneUrl({ ...base, host: 'redis.internal' })).toBe('redis://redis.internal:6379/0');
+  });
+
+  it('brackets bare IPv6 hosts so the URL is parseable', () => {
+    const url = buildRedisStandaloneUrl({ ...base, host: '::1' });
+    expect(url).toBe('redis://[::1]:6379/0');
+    expect(() => new URL(url)).not.toThrow();
+  });
+
+  it('keeps already-bracketed IPv6 hosts', () => {
+    expect(buildRedisStandaloneUrl({ ...base, host: '[2001:db8::1]', port: 6380, database: 2 })).toBe(
+      'redis://[2001:db8::1]:6380/2',
+    );
+  });
+
+  it('leaves IPv4 hosts unbracketed', () => {
+    expect(buildRedisStandaloneUrl({ ...base, host: '127.0.0.1' })).toBe('redis://127.0.0.1:6379/0');
   });
 });

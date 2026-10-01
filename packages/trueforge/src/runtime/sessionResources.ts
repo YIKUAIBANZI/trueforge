@@ -1,9 +1,10 @@
-import type { AgentSpec, SessionHandle } from '@truefoundry/trueforge-core/agent-session';
+import type { AgentSpec } from '@truefoundry/trueforge-core/agent-session';
 import {
   Sandbox,
   SkillMounter,
   type AgentDefinition,
   type AgentTracing,
+  type DaytonaSandboxEnvironment,
   type ModelParams,
   type RemoteMcpHeaders,
   type SandboxProvider,
@@ -13,107 +14,28 @@ import {
 import { HTTPException } from 'hono/http-exception';
 import { join } from 'node:path';
 import type { Logger } from 'winston';
-import { z } from 'zod';
 import configuration from '../config';
 import type { IMcpServerStore, IMcpServerWithAuthStore } from '../db/mcpServerStore';
 import type { IModelProviderStore } from '../db/modelProviderStore';
+import type { ISandboxEnvironmentStore } from '../db/sandboxEnvironmentStore';
 import type { ISandboxProviderStore } from '../db/sandboxProviderStore';
 import type { ISkillStore } from '../db/skillStore';
+import type { TurnMetadata } from '../db/turnMetadata';
+import type { IWebSearchProviderStore } from '../db/webSearchProviderStore';
 import { LocalSandboxProvider } from '../sandbox/local/provider/LocalSandboxProvider';
 import { getCachedLocalSandboxSupport, isLocalSandboxFallbackEnabled } from '../sandbox/localRuntime';
-import { toSandboxProviderFromRecord } from '../sandbox/providerUtils';
+import {
+  toSandboxEnvironment,
+  toSandboxProviderFromRecord,
+  type ResolvedSandboxProvider,
+} from '../sandbox/providerUtils';
 import type { ReasoningEffort } from '../schemas/modelProvider';
-import { resolveWebSearchProvider } from '../websearch/providers';
+import { DEFAULT_SANDBOX_ENVIRONMENT_NAME } from '../schemas/sandboxEnvironment';
+import { hasConfiguredWebSearchProvider } from '../websearch/providers';
 
 export interface McpConnection {
   url: string;
   headers: RemoteMcpHeaders;
-}
-
-/** Gateway header carrying stringified JSON metadata. */
-export const X_TFY_METADATA = 'x-tfy-metadata';
-
-/** Prefix for harness-owned keys */
-export const TFG_METADATA_PREFIX = 'tfg';
-
-const GatewayMetadataSchema = z.record(z.string().min(1), z.string());
-
-/**
- * Parse inbound `x-tfy-metadata`. Rejects malformed values rather than dropping them.
- */
-export function parseGatewayMetadataHeader(raw: string): Record<string, string> {
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(raw);
-  } catch (error) {
-    throw new HTTPException(400, { message: `${X_TFY_METADATA} must be a JSON object`, cause: error });
-  }
-  const parsed = GatewayMetadataSchema.safeParse(decoded);
-  if (!parsed.success) {
-    throw new HTTPException(400, {
-      message: `${X_TFY_METADATA} must be a JSON object of string values`,
-    });
-  }
-  return parsed.data;
-}
-
-export function buildGatewayMetadata(input: { session: SessionHandle; turnId: string }): Record<string, string> {
-  // Session.metadata is intentionally omitted for now (Unicode-in-header risk); re-add later.
-  const metadata: Record<string, string> = {
-    [`${TFG_METADATA_PREFIX}.session_id`]: input.session.session_id,
-    [`${TFG_METADATA_PREFIX}.turn_id`]: input.turnId,
-  };
-  const { agent } = input.session;
-  if (agent.type === 'reference') {
-    metadata[`${TFG_METADATA_PREFIX}.agent_id`] = agent.id;
-    if (agent.name !== null) {
-      metadata[`${TFG_METADATA_PREFIX}.agent_name`] = agent.name;
-    }
-  }
-  return metadata;
-}
-
-/** Inbound x-tfy-metadata first; harness tfg.* always win */
-export function mergeGatewayMetadata(input: {
-  session: SessionHandle;
-  turnId: string;
-  tfyMetadata?: Record<string, string> | undefined;
-}): Record<string, string> {
-  return {
-    ...input.tfyMetadata,
-    ...buildGatewayMetadata({ session: input.session, turnId: input.turnId }),
-  };
-}
-
-export function gatewayMetadataHeaders(metadata: Record<string, string>): Record<string, string> {
-  if (Object.keys(metadata).length === 0) {
-    return {};
-  }
-  return { [X_TFY_METADATA]: JSON.stringify(metadata) };
-}
-
-/**
- * Merge gateway metadata into MCP invoke headers. Preserves authRequired;
- * metadata is applied after auth/per-server headers.
- */
-export function withGatewayMetadataHeaders(input: {
-  headers: RemoteMcpHeaders;
-  metadataHeaders: Record<string, string>;
-}): RemoteMcpHeaders {
-  const { headers, metadataHeaders } = input;
-  if (Object.keys(metadataHeaders).length === 0) {
-    return headers;
-  }
-  if (typeof headers !== 'function') {
-    return { ...headers, ...metadataHeaders };
-  }
-  return async () => {
-    const result = await headers();
-    if ('authRequired' in result) {
-      return result;
-    }
-    return { headers: { ...result.headers, ...metadataHeaders } };
-  };
 }
 
 /** Split `provider/model` FQN. Returns undefined when the shape is not exactly one slash. */
@@ -137,10 +59,12 @@ export async function getModelDetails({
   tenant_id,
   name,
   store,
+  turnMetadata,
 }: {
   tenant_id: string;
   name: string;
   store: IModelProviderStore;
+  turnMetadata?: TurnMetadata;
 }): Promise<{
   providerConfig: VercelAIProviderConfig;
   defaultModelParams: ModelParams;
@@ -179,7 +103,7 @@ export async function getModelDetails({
       name,
       baseUrl,
       apiKey: provider.manifest.auth?.api_key ?? '',
-      headers: {},
+      headers: turnMetadata === undefined ? {} : await store.resolveInvokeHeaders({ record: provider, turnMetadata }),
     },
     defaultModelParams: model.properties.max_output_tokens ? { max_tokens: model.properties.max_output_tokens } : {},
     modelProperties: { contextLength: model.properties.context_length },
@@ -197,11 +121,13 @@ export async function getMcpConnection({
   name,
   store,
   userRef,
+  turnMetadata,
 }: {
   tenant_id: string;
   name: string;
   store: IMcpServerWithAuthStore;
   userRef: string;
+  turnMetadata?: TurnMetadata;
 }): Promise<McpConnection | undefined> {
   const record = await store.getServer({ tenant_id, name });
   if (record === undefined) {
@@ -209,15 +135,14 @@ export async function getMcpConnection({
   }
   return {
     url: record.manifest.url,
-    headers: store.resolveInvokeHeaders({ record, userRef }),
+    headers: store.resolveInvokeHeaders({
+      record,
+      userRef,
+      ...(turnMetadata === undefined ? {} : { turnMetadata }),
+    }),
   };
 }
 
-/**
- * Build a runtime SandboxProvider from the configured store row, or the
- * in-memory local fallback when standalone + the cached probe is supported.
- * Builds a fresh provider client per call (no network I/O).
- */
 /** Single path segment under the sandboxes parent (`_` when sessionId is missing or unsafe). */
 export function localSandboxSessionSegment(sessionId: string | undefined): string {
   if (sessionId === undefined || sessionId.length === 0 || sessionId.includes('/') || sessionId.includes('..')) {
@@ -226,6 +151,11 @@ export function localSandboxSessionSegment(sessionId: string | undefined): strin
   return sessionId;
 }
 
+/**
+ * Configured provider client, or standalone local fallback.
+ * Fresh client per call (no network I/O until a provider method runs).
+ * Environment is resolved separately via resolveSandboxEnvironment.
+ */
 export async function resolveSandboxProvider({
   tenant_id,
   store,
@@ -236,7 +166,7 @@ export async function resolveSandboxProvider({
   store: ISandboxProviderStore;
   logger: Logger;
   sessionId: string;
-}): Promise<SandboxProvider | undefined> {
+}): Promise<ResolvedSandboxProvider | LocalSandboxProvider | undefined> {
   const record = await store.getSandboxProvider(tenant_id);
   if (record !== undefined) {
     return toSandboxProviderFromRecord({ record, tenant_id, logger });
@@ -258,19 +188,62 @@ export async function resolveSandboxProvider({
 }
 
 /**
- * Builds a Sandbox for one turn from a resolved provider and skill mounts.
+ * Load a ready sandbox environment for create. Throws 422 when missing or not ready.
+ * When `optional` is true, a missing environment returns undefined instead of 422.
  */
-export function buildTurnSandbox(input: {
-  provider: SandboxProvider;
+export async function resolveSandboxEnvironment({
+  tenant_id,
+  name,
+  sandboxEnvironmentStore,
+  optional = false,
+}: {
+  tenant_id: string;
+  name: string;
+  sandboxEnvironmentStore: ISandboxEnvironmentStore;
+  optional?: boolean;
+}): Promise<DaytonaSandboxEnvironment | undefined> {
+  const loaded = await sandboxEnvironmentStore.getEnvironment({
+    tenant_id,
+    name,
+  });
+  if (loaded === undefined) {
+    if (optional) {
+      return undefined;
+    }
+    throw new HTTPException(422, {
+      message: `Unknown sandbox environment "${name}" — not configured`,
+    });
+  }
+  if (loaded.version.status !== 'ready') {
+    throw new HTTPException(422, {
+      message:
+        loaded.version.status === 'failed'
+          ? `Sandbox environment "${name}" build failed (${loaded.version.status_reason ?? 'unknown error'})`
+          : `Sandbox environment "${name}" is not ready (status: ${loaded.version.status}) — retry shortly`,
+    });
+  }
+  return toSandboxEnvironment({
+    external_ref: loaded.version.external_ref,
+    manifest: loaded.version.manifest,
+  });
+}
+
+/**
+ * Builds a Sandbox for one turn from a resolved provider, optional environment, and skill mounts.
+ */
+export function buildTurnSandbox<TEnvironment = undefined>(input: {
+  provider: SandboxProvider<TEnvironment>;
+  environment?: TEnvironment | undefined;
   logger: Logger;
   skills?: readonly Skill[];
   fileDownloadEnabled: boolean;
   existingSandboxId?: string | undefined;
   tracing: AgentTracing;
-}): Sandbox {
+}): Sandbox<TEnvironment> {
   // Empty mounter still uploads requested-skills file so existing skills are cleaned up.
   return new Sandbox({
     provider: input.provider,
+    ...(input.environment !== undefined ? { environment: input.environment } : {}),
     existingSandboxId: input.existingSandboxId,
     fileDownloadEnabled: input.fileDownloadEnabled,
     blockDestructiveToolsInCodeMode: true,
@@ -290,17 +263,23 @@ export function buildTurnSandbox(input: {
 export async function validateAgentSpec({
   spec,
   tenant_id,
+  created_by_subject_id,
   modelProviderStore,
   mcpServerStore,
   skillStore,
   sandboxProviderStore,
+  sandboxEnvironmentStore,
+  webSearchProviderStore,
 }: {
   spec: AgentSpec;
   tenant_id: string;
+  created_by_subject_id: string;
   modelProviderStore: IModelProviderStore;
   mcpServerStore: IMcpServerStore;
   skillStore: ISkillStore;
   sandboxProviderStore: ISandboxProviderStore;
+  sandboxEnvironmentStore: ISandboxEnvironmentStore;
+  webSearchProviderStore: IWebSearchProviderStore;
 }): Promise<void> {
   const resolved = await getModelDetails({
     tenant_id,
@@ -356,9 +335,26 @@ export async function validateAgentSpec({
     }
   }
 
-  if (spec.config.web_search.enabled && resolveWebSearchProvider() === undefined) {
-    throw new HTTPException(422, {
-      message: 'web_search is enabled but no web-search provider is configured',
+  const environmentName = spec.config.sandbox.environment_name;
+  if (environmentName && environmentName !== DEFAULT_SANDBOX_ENVIRONMENT_NAME) {
+    const environment = await sandboxEnvironmentStore.getEnvironment({
+      tenant_id,
+      name: environmentName,
+      created_by_subject_id,
     });
+    if (environment === undefined) {
+      throw new HTTPException(422, {
+        message: `Unknown sandbox environment "${environmentName}" — not configured`,
+      });
+    }
+  }
+
+  if (spec.config.web_search.enabled) {
+    const hasProvider = await hasConfiguredWebSearchProvider({ tenant_id, store: webSearchProviderStore });
+    if (!hasProvider) {
+      throw new HTTPException(422, {
+        message: 'web_search is enabled but no web-search provider is configured',
+      });
+    }
   }
 }
